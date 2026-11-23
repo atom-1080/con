@@ -1620,11 +1620,18 @@ select public.lsp_role() as my_role,
 -- ----------------------------------------------------------------------------
 -- S3 [RECONSTRUCTED] — helper EXECUTE privilege matrix (SQL Editor, read-only)
 -- ----------------------------------------------------------------------------
-select has_function_privilege('anon','public.lsp_is_admin()','EXECUTE')          as anon_exec,
-       has_function_privilege('authenticated','public.lsp_is_admin()','EXECUTE') as auth_exec,
-       has_function_privilege('anon','public.lsp_role()','EXECUTE')              as anon_exec_role,
-       has_function_privilege('authenticated','public.lsp_role()','EXECUTE')     as auth_exec_role;
--- expect: false, true, false, true
+-- to_regprocedure() gates each probe for the same reason as A10c and C5 (item 3):
+-- a text signature raises 42883 when the helper is absent, which would abort the
+-- whole batch. NULL here means "function does not exist", not "denied".
+select case when to_regprocedure('public.lsp_is_admin()') is null then null
+            else has_function_privilege('anon', to_regprocedure('public.lsp_is_admin()'), 'EXECUTE') end as anon_exec,
+       case when to_regprocedure('public.lsp_is_admin()') is null then null
+            else has_function_privilege('authenticated', to_regprocedure('public.lsp_is_admin()'), 'EXECUTE') end as auth_exec,
+       case when to_regprocedure('public.lsp_role()') is null then null
+            else has_function_privilege('anon', to_regprocedure('public.lsp_role()'), 'EXECUTE') end as anon_exec_role,
+       case when to_regprocedure('public.lsp_role()') is null then null
+            else has_function_privilege('authenticated', to_regprocedure('public.lsp_role()'), 'EXECUTE') end as auth_exec_role;
+-- expect: false, true, false, true (or NULL columns before Section B has run)
 
 -- ----------------------------------------------------------------------------
 -- S4 [RECONSTRUCTED] — profiles INSERT policy shape (SQL Editor, read-only)
