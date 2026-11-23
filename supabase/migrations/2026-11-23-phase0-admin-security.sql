@@ -1392,51 +1392,118 @@ order by p.proname;
 -- you deliberately uncomment it, and each one names the A0h row that licenses it.
 -- ============================================================================
 
--- D.1  RESTORE. Fill in R1-R4 from A0b/A0f, A0, A0e, then uncomment the block.
+-- D.1  RESTORE — the exact original state, or nothing.
 -- ----------------------------------------------------------------------------
--- begin;
+-- D.1 IS DRIVEN BY A0h. For each of the 14 objects B creates or replaces, A0h
+-- reports pre_existing and a rollback_action. Read it before uncommenting
+-- anything, then run only the branch it licenses:
 --
--- drop trigger if exists lsp_guard_document_status       on public.provider_documents;
--- drop trigger if exists lsp_guard_provider_verification on public.provider_profiles;
--- drop trigger if exists lsp_guard_profile_role          on public.profiles;
+--   pre_existing = false -> D.1.1 drops the object (B created it)
+--   pre_existing = true  -> D.1.3 restores the captured original (do NOT drop)
 --
--- drop function if exists public.lsp_guard_document_status();
--- drop function if exists public.lsp_guard_provider_verification();
--- drop function if exists public.lsp_guard_profile_role();
+-- Revision 6 ran one unconditional DROP list. Against a pre-existing trigger,
+-- guard function or constraint that list deleted an object the migration had
+-- overwritten, and nothing could put it back. Dropping a pre-existing object is
+-- now a named mistake, not a default.
 --
--- alter table public.profiles drop constraint if exists profiles_role_allowed;
+-- Requires the saved Section A output: A0 (function definition, owner, ACL),
+-- A0c (trigger definition + tgenabled), A0g (constraint definition +
+-- convalidated), A0e/A0f (ready-to-run restore text), A0h (which branch applies).
+-- Without that output only the pre_existing = false branch is safe.
 --
--- drop policy if exists lsp_profiles_insert  on public.profiles;
--- drop policy if exists lsp_providers_insert on public.provider_profiles;
--- drop policy if exists lsp_providers_update on public.provider_profiles;
--- drop policy if exists lsp_documents_owner  on public.provider_documents;
+-- ORDER MATTERS: triggers reference functions, so drop a trigger before the
+-- function it calls, and restore a function before the trigger that calls it.
+
+-- D.1.0 PRECONDITIONS.
+--   The session must be able to SET ROLE to every owner D.1.2 restores to. A4c's
+--   can_reassign_helper_owner proves it for the APPLY session; re-check it if the
+--   rollback runs from a different one. The trigger drops take ACCESS EXCLUSIVE
+--   on all three tables: stop clients first.
+--   begin;
+
+-- D.1.1 DROP ONLY WHAT B CREATED. Uncomment a line only when A0h reports
+--       pre_existing = false for that object. When A0h reports true, that object
+--       belongs in D.1.3 and dropping it here destroys the original.
 --
--- -- R1 <paste the CREATE POLICY statements rendered by A0f (raw rows: A0b).
--- --      Four policies, with permissive/roles/cmd/qual/with_check as captured.
--- --      If A0b showed a policy did not exist before B, skip that one: it is a
--- --      genuine creation and D removes it rather than restoring it.>
+-- -- triggers first, so the functions below are unreferenced
+-- drop trigger if exists lsp_guard_document_status       on public.provider_documents;  -- A0h false only
+-- drop trigger if exists lsp_guard_provider_verification on public.provider_profiles;  -- A0h false only
+-- drop trigger if exists lsp_guard_profile_role          on public.profiles;           -- A0h false only
 --
--- -- R2 <paste the CREATE OR REPLACE FUNCTION statements for lsp_role,
+-- drop function if exists public.lsp_guard_document_status();        -- A0h false only
+-- drop function if exists public.lsp_guard_provider_verification();  -- A0h false only
+-- drop function if exists public.lsp_guard_profile_role();           -- A0h false only
+--
+-- -- The constraint is NOT VALID: no row was scanned or rewritten, so dropping it
+-- -- restores nothing except its own absence. A0h still decides.
+-- alter table public.profiles drop constraint if exists profiles_role_allowed;       -- A0h false only
+--
+-- drop policy if exists lsp_profiles_insert  on public.profiles;                      -- A0h false only
+-- drop policy if exists lsp_providers_insert on public.provider_profiles;             -- A0h false only
+-- drop policy if exists lsp_providers_update on public.provider_profiles;             -- A0h false only
+-- drop policy if exists lsp_documents_owner  on public.provider_documents;            -- A0h false only
+
+-- D.1.2 RESTORE THE THREE REPLACED HELPERS (R1-R4). These always pre-exist, so
+--       they are never dropped — many policies call them and dropping them would
+--       break every one of those policies.
+--
+-- -- R1 <paste the CREATE OR REPLACE FUNCTION statements for lsp_role,
 -- --      lsp_is_admin and lsp_provider_ids from A0's definition column.
 -- --      pg_get_functiondef output includes the SET search_path clauses and the
 -- --      SECURITY DEFINER bit, so those come back with the body. It does NOT
--- --      include the owner or the ACL — those are R3 and R4.>
+-- --      include the owner or the ACL — those are R2 and R3.>
 --
--- -- R3 <for each of the three, restore the owner recorded by A0's owner column:
+-- -- R2 <for each of the three, restore the owner recorded by A0's owner column:
 -- --      alter function public.lsp_role() owner to <owner-from-A0>;
 -- --      Needs the same SET ROLE privilege B2.1 required.>
 --
--- -- R4 <restore the ACL recorded by A0's acl column, using A0e's rendered
+-- -- R3 <restore the ACL recorded by A0's acl column, using A0e's rendered
 -- --      statements. Restore EXACTLY, which means revoking first: PostgreSQL
 -- --      grants EXECUTE on a new function to PUBLIC, so a plain re-grant would
 -- --      leave a PUBLIC grant that did not exist before.
 -- --        revoke all on function public.lsp_role() from public, anon, authenticated, service_role;
 -- --        <then replay A0e's grant lines for that function>>
+
+-- D.1.3 RESTORE PRE-EXISTING OBJECTS (R4-R6). Run only the lines whose A0h row
+--       says pre_existing = true. Order: function before the trigger that calls
+--       it, trigger before its table is used again.
 --
+-- -- R4 <guard function, if A0h: true. Paste A0's pg_get_functiondef for it, then
+-- --      restore owner and ACL exactly as R2/R3 do for the helpers:
+-- --        alter function public.lsp_guard_profile_role() owner to <A0 owner>;
+-- --        revoke all on function public.lsp_guard_profile_role() from public, anon, authenticated, service_role;
+-- --        <replay A0e grant lines for that function>>
+--
+-- -- R5 <trigger, if A0h: true. Paste A0c's restore_statement verbatim: it
+-- --      carries the definition AND the enabled state, because a trigger captured
+-- --      as tgenabled = 'D' must come back DISABLED.
+-- --        <A0c definition>;  alter table public.profiles disable trigger lsp_guard_profile_role;
+-- --      tgenabled = 'O' needs no second statement; 'R' and 'A' each have their
+-- --      own and A0c emits the right one.>
+--
+-- -- R6 <constraint, if A0h: true. Paste A0g's restore_statement verbatim:
+-- --        alter table public.profiles add constraint profiles_role_allowed <definition>;
+-- --      pg_get_constraintdef emits NOT VALID when the captured constraint was
+-- --      unvalidated, so validation state returns with the definition. Compare
+-- --      the result against A0g's convalidated column — a captured
+-- --      convalidated = true must come back validated.>
+
+-- D.1.4 VERIFY BEFORE COMMIT. Do not commit on faith.
+--   Re-run the read-only checks and compare against the captured output:
+--     C1/C1b  helpers: definer, pinned search_path, owner = profiles owner, ACL
+--             identical to A0's "before" text
+--     C2      guard triggers: count 0 if all three were created by B, otherwise
+--             the A0c count, with the same tgenabled values
+--     C6      profiles_role_allowed: absent, or A0g's definition AND convalidated
+--     A0h     every row now reads the opposite of its captured pre_existing
+--   Only then:
 -- -- commit;
---
--- The three helpers are never dropped: many policies call them, and dropping
--- them would break every policy that references them.
+
+-- D.1.5 WHAT IS NOT REVERSIBLE EVEN HERE. Rows written between apply and
+--       rollback are untouched by every statement above: the guard triggers are
+--       BLOCKED-ATTEMPT guards (D.2 items 17-20) and the PERSISTED coercions
+--       (D.2 items 21-23) stay written. The raise log is their only record. D.1
+--       restores the SCHEMA, not the data.
 
 -- D.2  OBJECT-BY-OBJECT RESTORE MAP.
 -- ----------------------------------------------------------------------------
@@ -1453,13 +1520,13 @@ order by p.proname;
 --
 -- | # | object                                  | before B      | effect of B | restore | recoverable from |
 -- |---|-----------------------------------------|---------------|-------------|---------|------------------|
--- | 1 | trigger lsp_guard_profile_role          | absent        | created     | drop    | n/a — new object |
--- | 2 | trigger lsp_guard_provider_verification | absent        | created     | drop    | n/a — new object |
--- | 3 | trigger lsp_guard_document_status       | absent        | created     | drop    | n/a — new object |
--- | 4 | function lsp_guard_profile_role         | absent        | created     | drop    | n/a — new object |
--- | 5 | function lsp_guard_provider_verification| absent        | created     | drop    | n/a — new object |
--- | 6 | function lsp_guard_document_status      | absent        | created     | drop    | n/a — new object |
--- | 7 | constraint profiles_role_allowed        | absent        | created NOT VALID | drop | n/a — no row scanned or rewritten |
+-- | 1 | trigger lsp_guard_profile_role          | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R5 | YES — A0c definition + tgenabled |
+-- | 2 | trigger lsp_guard_provider_verification | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R5 | YES — A0c definition + tgenabled |
+-- | 3 | trigger lsp_guard_document_status       | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R5 | YES — A0c definition + tgenabled |
+-- | 4 | function lsp_guard_profile_role         | A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R4 | YES — A0 definition, owner, ACL |
+-- | 5 | function lsp_guard_provider_verification| A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R4 | YES — A0 definition, owner, ACL |
+-- | 6 | function lsp_guard_document_status      | A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R4 | YES — A0 definition, owner, ACL |
+-- | 7 | constraint profiles_role_allowed        | A0g: absent, or present (B leaves a same-named one untouched) | created NOT VALID if absent; unchanged if present | A0h false: drop (D.1.1); A0h true: R6 | YES — A0g definition + convalidated; no row scanned or rewritten |
 -- | 8 | policy lsp_profiles_insert              | A0b row or absent | replaced | drop + R1 | YES — A0b/A0f, exactly |
 -- | 9 | policy lsp_providers_insert             | A0b row (expected live) | replaced | drop + R1 | YES — A0b/A0f, exactly |
 -- |10 | policy lsp_providers_update             | A0b row or absent | replaced | drop + R1 | YES — A0b/A0f, exactly |
