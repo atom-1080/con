@@ -1,6 +1,6 @@
 -- ============================================================================
 -- LSP CONNECT — PHASE 0: ADMIN SECURITY FOUNDATION
--- STATUS: PROPOSAL ONLY — REVISION 6 — NOT APPLIED — NOTHING EXECUTED
+-- STATUS: PROPOSAL ONLY — REVISION 7 — NOT APPLIED — NOTHING EXECUTED
 --
 -- ----------------------------------------------------------------------------
 -- WHAT WAS ACTUALLY IN THE REPOSITORY WHEN REVISION 6 STARTED
@@ -35,7 +35,59 @@
 --      Nothing was overwritten, discarded or re-derived from memory.
 --
 -- ----------------------------------------------------------------------------
--- REVISION 6 CHANGES (this review round)
+-- REVISION 7 CHANGES (this review round)
+--
+--   1. ROLLBACK IS COMPLETE, OR THE MIGRATION REFUSES TO RUN (item 1).
+--      Revision 6 assumed every object it touched was new, so D.1 could only
+--      DROP. A pre-existing trigger, guard function or constraint was therefore
+--      destroyed with no way back. Revision 7 adds:
+--        A0c  trigger capture now records tgenabled and emits a ready-to-run
+--             restore_statement (definition + enabled state).
+--        A0g  constraint capture: definition, convalidated, deferrability and a
+--             ready-to-run restore_statement. pg_get_constraintdef emits
+--             NOT VALID, so validation state travels with the definition.
+--        A0h  CONFLICT REGISTER: for each of the 11 created objects and the 3
+--             replaced helpers, whether it pre-exists and whether D.1 must DROP
+--             it or RESTORE it. This is the list D.1 is driven by.
+--        B0b  FAIL-CLOSED PREFLIGHT: aborts the transaction before any object is
+--             modified when a pre-existing trigger, guard function, constraint
+--             or helper overload would be overwritten. A deliberate re-run needs
+--             an explicit opt-in setting.
+--        D.1  restructured: D.1.1 drops only what B created, D.1.2 restores the
+--             three replaced helpers, D.1.3 restores pre-existing guard
+--             functions, triggers and the constraint, D.1.4 verifies before
+--             commit.
+--
+--   2. ROLE MEMBERSHIP IS TESTED CORRECTLY (item 2 — A4c, B2.1).
+--      Revision 6 gated ownership reassignment on pg_has_role(..., 'USAGE').
+--      'USAGE' means the role's privileges are available WITHOUT SET ROLE, which
+--      an inherited membership satisfies even when SET ROLE is impossible: the
+--      gate could pass and the ALTER then fail. Revision 7 reports version() and
+--      server_version_num, uses 'SET' on PostgreSQL 16+ (which also honours a
+--      membership granted WITHOUT SET) and 'MEMBER' below 16 (where no SET
+--      option exists), treats superuser and current_user = owner as permitted,
+--      and re-reads ownership after the ALTER to prove it took effect.
+--
+--   3. A10c SURVIVES A MISSING FUNCTION (item 3).
+--      has_function_privilege(<text signature>) raises 42883 when the function
+--      does not exist, which aborted the whole diagnostic batch on a database
+--      where Section B had not run yet. A10c now resolves the name with
+--      to_regprocedure() first and returns NULL for the privilege when the
+--      function is absent. C5 gets the same treatment.
+--
+--   4. provider_profiles RLS DEPENDENCY MADE EXPLICIT (B2.3, C9).
+--      The provider_profiles policies only constrain anything while RLS is
+--      ENABLED there, and lsp_provider_ids() — which lsp_documents_owner calls —
+--      can only bypass RLS if its owner is the provider_profiles owner and FORCE
+--      RLS is off. Neither was checked: a wrong state is silent at apply time and
+--      denies every provider access to their own documents later. B2.3 fails
+--      closed on either condition; C9 reports the state read-only.
+--
+--   5. STILL NOT EXECUTED. No statement below has been run against any database.
+--      Section S remains DESIGNED, NOT EXECUTED.
+--
+-- ----------------------------------------------------------------------------
+-- REVISION 6 CHANGES (previous round — retained for provenance)
 --
 --   A. SECTION C — SQL CORRECTNESS
 --      1. Every aggregate is count(*). There is no zero-argument count() call
@@ -121,11 +173,28 @@ where schemaname = 'public' and policyname like 'lsp\_%'
 order by tablename, policyname;
 
 -- A0c. CAPTURE BEFORE MIGRATING — TRIGGERS on the three tables this migration
---      touches, including tgenabled. A pre-existing trigger whose name this
---      migration reuses must be restored from this output.
-select c.relname as table_name, t.tgname, t.tgenabled,
-       pg_get_triggerdef(t.oid) as definition
-from pg_trigger t join pg_class c on c.oid = t.tgrelid
+--      touches. tgenabled is captured because enabled state is STATE, not part of
+--      the definition: 'O' enabled, 'D' disabled, 'R' replica only, 'A' always.
+--      restore_statement rebuilds the trigger from its definition AND reapplies
+--      the enabled state, so D.1 R6 is mechanical instead of remembered.
+--      B0b aborts if any of the three guard names already exists, so this capture
+--      is only needed when you override that gate deliberately.
+select c.relname as table_name,
+       t.tgname,
+       t.tgenabled,
+       case t.tgenabled when 'O' then 'enabled'
+                        when 'D' then 'disabled'
+                        when 'R' then 'replica only'
+                        when 'A' then 'always' end as enabled_state,
+       pg_get_triggerdef(t.oid) as definition,
+       pg_get_triggerdef(t.oid)
+         || case t.tgenabled
+              when 'D' then format('; alter table %I.%I disable trigger %I;', n.nspname, c.relname, t.tgname)
+              when 'R' then format('; alter table %I.%I enable replica trigger %I;', n.nspname, c.relname, t.tgname)
+              when 'A' then format('; alter table %I.%I enable always trigger %I;', n.nspname, c.relname, t.tgname)
+              else '' end as restore_statement
+from pg_trigger t
+join pg_class c on c.oid = t.tgrelid
 join pg_namespace n on n.oid = c.relnamespace
 where n.nspname = 'public' and not t.tgisinternal
   and c.relname in ('profiles','provider_profiles','provider_documents')
@@ -179,6 +248,84 @@ from pg_policies
 where schemaname = 'public' and policyname like 'lsp\_%'
 order by tablename, policyname;
 
+-- A0g. CAPTURE BEFORE MIGRATING — CONSTRAINTS on public.profiles.
+--      B1 adds profiles_role_allowed only when the name is absent, so a
+--      pre-existing constraint of that name is left untouched by B and D.1 must
+--      know whether it is allowed to drop it. convalidated matters: B creates it
+--      NOT VALID, so a VALIDATED constraint of that name came from somewhere else
+--      and restoring it as NOT VALID would silently weaken it.
+--      pg_get_constraintdef emits NOT VALID for an unvalidated constraint, so
+--      restore_statement reproduces the definition AND the validation state.
+select c.conname,
+       c.contype,
+       c.convalidated,
+       c.condeferrable,
+       c.condeferred,
+       c.conkey,
+       pg_get_constraintdef(c.oid) as definition,
+       format('alter table public.profiles add constraint %I %s;',
+              c.conname, pg_get_constraintdef(c.oid)) as restore_statement
+from pg_constraint c
+where c.conrelid = 'public.profiles'::regclass
+order by c.conname;
+
+-- A0h. CONFLICT REGISTER — the exact list D.1 is driven by.
+--      One row per object B creates (11) and per helper B replaces (3).
+--        scope         'created'  = B should create it
+--                      'replaced' = it exists by design and B overwrites it
+--        pre_existing  is it already in the catalogue?
+--        rollback_action  what D.1 must do about it
+--      Read this before opening D.1. A pre-existing object that is not identical
+--      to what B installs is a conflict, and B0b aborts on it unless you opt in
+--      deliberately. Every row marked RESTORE needs its A0/A0c/A0g output saved
+--      before B runs.
+with expected(scope, kind, name, on_object) as (
+  values
+    ('created',  'trigger',         'lsp_guard_profile_role',          'profiles'),
+    ('created',  'trigger',         'lsp_guard_provider_verification', 'provider_profiles'),
+    ('created',  'trigger',         'lsp_guard_document_status',       'provider_documents'),
+    ('created',  'guard function',  'lsp_guard_profile_role',          '(function)'),
+    ('created',  'guard function',  'lsp_guard_provider_verification', '(function)'),
+    ('created',  'guard function',  'lsp_guard_document_status',       '(function)'),
+    ('created',  'policy',          'lsp_providers_insert',            'provider_profiles'),
+    ('created',  'policy',          'lsp_providers_update',            'provider_profiles'),
+    ('created',  'policy',          'lsp_profiles_insert',             'profiles'),
+    ('created',  'policy',          'lsp_documents_owner',             'provider_documents'),
+    ('created',  'constraint',      'profiles_role_allowed',           'profiles'),
+    ('replaced', 'helper function', 'lsp_role',                        '(function)'),
+    ('replaced', 'helper function', 'lsp_is_admin',                    '(function)'),
+    ('replaced', 'helper function', 'lsp_provider_ids',                '(function)')
+),
+present(kind, name, on_object) as (
+  select 'trigger', t.tgname, c.relname
+  from pg_trigger t
+  join pg_class c on c.oid = t.tgrelid
+  join pg_namespace n on n.oid = c.relnamespace
+  where n.nspname = 'public' and not t.tgisinternal
+  union all
+  select 'guard function', p.proname, '(function)'
+  from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+  where n.nspname = 'public' and pg_get_function_identity_arguments(p.oid) = ''
+  union all
+  select 'helper function', p.proname, '(function)'
+  from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+  where n.nspname = 'public' and pg_get_function_identity_arguments(p.oid) = ''
+  union all
+  select 'policy', policyname, tablename
+  from pg_policies where schemaname = 'public'
+  union all
+  select 'constraint', conname, 'profiles'
+  from pg_constraint where conrelid = 'public.profiles'::regclass
+)
+select e.scope, e.kind, e.name, e.on_object,
+       (p.name is not null) as pre_existing,
+       case when p.name is not null then 'RESTORE (D.1.3) — do NOT drop'
+            else 'DROP (D.1.1) — created by B' end as rollback_action
+from expected e
+left join present p
+  on p.kind = e.kind and p.name = e.name and p.on_object = e.on_object
+order by e.scope, e.kind, e.name;
+
 -- A1. Every policy on the public schema. Non-lsp_* rows are outside this
 --     migration and must be reviewed manually.
 select tablename, policyname, cmd, roles, qual, with_check
@@ -209,17 +356,49 @@ select c.relname, r.rolname as table_owner
 from pg_class c join pg_roles r on r.oid = c.relowner
 where c.oid = 'public.profiles'::regclass;
 
--- A4c. Who is executing this script, and can it reassign ownership?
---      Expect current_user = postgres and table_owner = postgres.
-select current_user as executing_role,
+-- A4c. WHO IS EXECUTING THIS SCRIPT, ON WHICH SERVER, AND CAN IT REASSIGN
+--      OWNERSHIP? Ownership reassignment (B2.1) needs the ability to SET ROLE to
+--      the new owner. Revision 6 tested pg_has_role(..., 'USAGE'), which is a
+--      DIFFERENT privilege: 'USAGE' means the role's privileges are available
+--      WITHOUT SET ROLE, so an inherited membership satisfies it even when
+--      SET ROLE is impossible — the gate could pass and the ALTER then fail.
+--      Correct, version-compatible test:
+--        PostgreSQL 16+   pg_has_role(..., 'SET')    — also honours a membership
+--                                                      granted WITHOUT SET
+--        PostgreSQL < 16  pg_has_role(..., 'MEMBER') — no SET option exists, so
+--                                                      membership IS the capability
+--      A superuser can always SET ROLE to any role, and a session that already IS
+--      the owner needs no switch, so both count as permitted.
+--      Expect current_user = postgres and can_reassign_helper_owner = true.
+select version() as server_version,
+       current_setting('server_version_num')::int as server_version_num,
+       current_user as executing_role,
        session_user as login_role,
-       version() as server,
-       (select r.rolname from pg_class c join pg_roles r on r.oid = c.relowner
-        where c.oid = 'public.profiles'::regclass) as table_owner,
-       pg_has_role(current_user,
-                   (select r.rolname from pg_class c join pg_roles r on r.oid = c.relowner
-                    where c.oid = 'public.profiles'::regclass),
-                   'USAGE') as can_set_role_to_owner;
+       (select r.rolsuper from pg_roles r where r.rolname = current_user) as executing_is_superuser,
+       (select r.rolcreaterole from pg_roles r where r.rolname = current_user) as executing_can_create_role,
+       o.profiles_owner,
+       o.provider_profiles_owner,
+       o.provider_documents_owner,
+       case when current_setting('server_version_num')::int >= 160000
+            then 'SET' else 'MEMBER' end as membership_check_used,
+       case when current_setting('server_version_num')::int >= 160000
+            then pg_has_role(current_user, o.profiles_owner, 'SET')
+            else pg_has_role(current_user, o.profiles_owner, 'MEMBER') end as can_set_role_to_profiles_owner,
+       pg_has_role(current_user, o.profiles_owner, 'USAGE') as usage_privilege_not_sufficient,
+       (current_user = o.profiles_owner
+        or coalesce((select r.rolsuper from pg_roles r where r.rolname = current_user), false)
+        or case when current_setting('server_version_num')::int >= 160000
+                then pg_has_role(current_user, o.profiles_owner, 'SET')
+                else pg_has_role(current_user, o.profiles_owner, 'MEMBER') end
+       ) as can_reassign_helper_owner
+from (
+  select (select r.rolname from pg_class c join pg_roles r on r.oid = c.relowner
+           where c.oid = 'public.profiles'::regclass) as profiles_owner,
+         (select r.rolname from pg_class c join pg_roles r on r.oid = c.relowner
+           where c.oid = to_regclass('public.provider_profiles')) as provider_profiles_owner,
+         (select r.rolname from pg_class c join pg_roles r on r.oid = c.relowner
+           where c.oid = to_regclass('public.provider_documents')) as provider_documents_owner
+) o;
 
 -- A5. Column privileges on profiles — if UPDATE on `role` appears, escalation is reachable.
 select grantee, privilege_type, column_name
@@ -258,13 +437,30 @@ where schemaname = 'public' and cmd <> 'SELECT'
 order by tablename, policyname;
 
 -- A10c. Column-level probes on profiles (PUBLIC- and inheritance-aware).
+--       has_function_privilege() given a TEXT signature resolves the name and
+--       raises 42883 when the function does not exist — which aborted this whole
+--       diagnostic batch on any database where Section B had not run yet.
+--       to_regprocedure() resolves the same name to NULL instead of raising, so
+--       existence is tested first and the privilege probe is skipped when absent:
+--       the column reads as NULL ("not applicable yet"), never as an error and
+--       never as false ("exists but denied").
 select has_table_privilege('anon','public.profiles','INSERT') as anon_insert,
        has_table_privilege('anon','public.profiles','UPDATE') as anon_update,
        has_table_privilege('anon','public.profiles','DELETE') as anon_delete,
        has_column_privilege('anon','public.profiles','role','UPDATE') as anon_update_role,
        has_column_privilege('authenticated','public.profiles','role','UPDATE') as auth_update_role,
-       has_function_privilege('anon','public.lsp_is_admin()','EXECUTE') as anon_exec_after,
-       has_function_privilege('authenticated','public.lsp_is_admin()','EXECUTE') as auth_exec_after;
+       to_regprocedure('public.lsp_is_admin()') is not null as lsp_is_admin_exists,
+       case when to_regprocedure('public.lsp_is_admin()') is null then null
+            else has_function_privilege('anon', to_regprocedure('public.lsp_is_admin()'), 'EXECUTE')
+       end as anon_exec_is_admin,
+       case when to_regprocedure('public.lsp_is_admin()') is null then null
+            else has_function_privilege('authenticated', to_regprocedure('public.lsp_is_admin()'), 'EXECUTE')
+       end as auth_exec_is_admin,
+       to_regprocedure('public.lsp_role()') is not null as lsp_role_exists,
+       to_regprocedure('public.lsp_provider_ids()') is not null as lsp_provider_ids_exists;
+-- expect BEFORE B: lsp_is_admin_exists = false, both exec columns NULL.
+-- expect AFTER B:  lsp_is_admin_exists = true, anon_exec_is_admin = false,
+--                  auth_exec_is_admin = true.
 
 -- A11. Documents/skills policies and the document status distribution.
 select tablename, policyname, cmd, roles, qual, with_check from pg_policies
