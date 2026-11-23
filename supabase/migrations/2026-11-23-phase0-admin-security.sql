@@ -519,6 +519,145 @@ begin;
 --     all of them). The six genuinely new objects are the 3 triggers and the
 --     3 guard functions; C8c names all eleven explicitly.
 
+-- B0b. CONFLICT PREFLIGHT — FAIL CLOSED BEFORE ANY OBJECT IS MODIFIED.
+--      Revision 6 overwrote whatever it found: CREATE OR REPLACE on the three
+--      guard functions, DROP TRIGGER + CREATE TRIGGER on the three names, and
+--      ADD CONSTRAINT only-if-absent. Its rollback could only drop, so a
+--      pre-existing object was destroyed with no way back. This block runs before
+--      the first modification and aborts the transaction instead.
+--
+--      Aborts when:
+--        * one of the three guard trigger NAMES already exists on any table in
+--          public — B drops those names unconditionally;
+--        * a guard FUNCTION already exists — CREATE OR REPLACE would overwrite a
+--          body that D.1 cannot replay from A0 automatically;
+--        * profiles_role_allowed exists and is VALIDATED (B creates NOT VALID, so
+--          a validated one is somebody else's), or checks a different column, or
+--          uses a different role vocabulary;
+--        * a helper name resolves to more than one function in public, or to one
+--          with a different return type — CREATE OR REPLACE would rewrite one and
+--          leave the policies calling another.
+--
+--      DELIBERATE RE-RUN, only after saving A0, A0c, A0g and A0h:
+--        set local lsp.allow_preexisting_objects = 'on';
+--      Default is abort. The setting is read with current_setting(..., true), so
+--      an unset value is never an error.
+--
+--      Note this gate is why A0c/A0g are captures and not assumptions: if it does
+--      abort, the capture you saved is the only copy of what was there.
+do $$
+declare
+  v_conflicts text[]  := '{}';
+  v_override  boolean := coalesce(current_setting('lsp.allow_preexisting_objects', true), 'off') = 'on';
+  v_def       text;
+  v_con_valid boolean;
+  v_con_key   smallint[];
+  v_literals  text[];
+  v_ret       text;
+  v_retset    boolean;
+  r           record;
+begin
+  -- (1) Guard trigger names, anywhere in public.
+  for r in
+    select c.relname, t.tgname, pg_get_triggerdef(t.oid) as def
+    from pg_trigger t
+    join pg_class c on c.oid = t.tgrelid
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public' and not t.tgisinternal
+      and t.tgname in ('lsp_guard_profile_role','lsp_guard_provider_verification','lsp_guard_document_status')
+  loop
+    v_conflicts := v_conflicts || format('trigger %I on public.%I would be dropped by B: %s',
+                                         r.tgname, r.relname, r.def);
+  end loop;
+
+  -- (2) Guard functions.
+  for r in
+    select p.proname, pg_get_userbyid(p.proowner) as owner, p.prosecdef, p.proconfig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.proname in ('lsp_guard_profile_role','lsp_guard_provider_verification','lsp_guard_document_status')
+      and pg_get_function_identity_arguments(p.oid) = ''
+  loop
+    v_conflicts := v_conflicts || format('function public.%I() would be overwritten by CREATE OR REPLACE (owner %s, security definer %s, config %s)',
+                                         r.proname, r.owner, r.prosecdef,
+                                         coalesce(array_to_string(r.proconfig, ','), '(none)'));
+  end loop;
+
+  -- (3) profiles_role_allowed: absent is the normal case; present must match what
+  --     B would create, otherwise D.1 would be deciding to drop someone else's.
+  select pg_get_constraintdef(c.oid), c.convalidated, c.conkey
+    into v_def, v_con_valid, v_con_key
+  from pg_constraint c
+  where c.conrelid = 'public.profiles'::regclass
+    and c.conname = 'profiles_role_allowed';
+
+  if found then
+    if v_con_valid then
+      v_conflicts := v_conflicts || format('constraint profiles_role_allowed exists and is VALIDATED — B creates it NOT VALID, so this is a different object: %s', v_def);
+    else
+      select array_agg(distinct m[1] order by m[1]) into v_literals
+      from regexp_matches(v_def, '''([a-z_]+)''', 'g') as m;
+
+      if v_literals is distinct from array['admin','customer','provider'] then
+        v_conflicts := v_conflicts || format('constraint profiles_role_allowed exists with a different role vocabulary (%s): %s',
+                                             coalesce(array_to_string(v_literals, ','), '(none)'), v_def);
+      elsif v_con_key is distinct from array[(select a.attnum from pg_attribute a
+                                               where a.attrelid = 'public.profiles'::regclass
+                                                 and a.attname = 'role'
+                                                 and not a.attisdropped)] then
+        v_conflicts := v_conflicts || format('constraint profiles_role_allowed exists but does not check exactly profiles.role (conkey %s): %s',
+                                             v_con_key, v_def);
+      end if;
+    end if;
+  end if;
+
+  -- (4) Helper overloads and return types.
+  for r in
+    select p.proname,
+           count(*) as n,
+           string_agg(format('%s -> %s%s',
+                             coalesce(nullif(pg_get_function_identity_arguments(p.oid), ''), '(no args)'),
+                             format_type(p.prorettype, null),
+                             case when p.proretset then ' setof' else '' end),
+                      '; ' order by p.oid) as sigs
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.proname in ('lsp_role','lsp_is_admin','lsp_provider_ids')
+    group by p.proname
+  loop
+    if r.n > 1 then
+      v_conflicts := v_conflicts || format('public.%I has %s functions in public (%s) — CREATE OR REPLACE would rewrite only one and the policies would keep calling another',
+                                           r.proname, r.n, r.sigs);
+    else
+      select format_type(p.prorettype, null), p.proretset
+        into v_ret, v_retset
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'public' and p.proname = r.proname
+        and pg_get_function_identity_arguments(p.oid) = '';
+
+      if    (r.proname = 'lsp_role'         and (v_ret <> 'text'    or v_retset))
+         or (r.proname = 'lsp_is_admin'     and (v_ret <> 'boolean' or v_retset))
+         or (r.proname = 'lsp_provider_ids' and (v_ret <> 'uuid'    or not v_retset)) then
+        v_conflicts := v_conflicts || format('public.%I() exists with return type %s%s, which is not what B installs — CREATE OR REPLACE would fail or create an overload',
+                                             r.proname, v_ret, case when v_retset then ' setof' else '' end);
+      end if;
+    end if;
+  end loop;
+
+  if coalesce(array_length(v_conflicts, 1), 0) > 0 then
+    if v_override then
+      raise notice 'lsp: % pre-existing object(s) detected, continuing because lsp.allow_preexisting_objects = on. D.1 must RESTORE these, not drop them: %',
+        array_length(v_conflicts, 1), array_to_string(v_conflicts, ' | ');
+    else
+      raise exception 'lsp_preflight_conflict: % pre-existing object(s) would be overwritten and could not be restored automatically. Nothing has been modified. Save A0, A0c, A0g and A0h, then either drop or rename them deliberately, or re-run with  set local lsp.allow_preexisting_objects = ''on'';  after saving that output.',
+        array_length(v_conflicts, 1)
+        using detail = array_to_string(v_conflicts, E'\n');
+    end if;
+  else
+    raise notice 'lsp: preflight clear — none of the 11 created objects and none of the 3 replaced helpers is a conflict';
+  end if;
+end $$;
+
 -- B1. Role vocabulary. profiles.role is plain text with no constraint (there is
 --     no app_role enum). NOT VALID scans nothing, rejects nothing and rewrites
 --     nothing on apply, but is enforced for every later INSERT/UPDATE. A CHECK
@@ -569,8 +708,13 @@ $$;
 --      manual instruction is built with format() and passed as an argument.
 do $$
 declare
-  tbl_owner text;
-  fn        record;
+  tbl_owner  text;
+  fn         record;
+  v_srv_num  int     := current_setting('server_version_num')::int;
+  v_check    text    := case when current_setting('server_version_num')::int >= 160000
+                             then 'SET' else 'MEMBER' end;
+  v_can_set  boolean;
+  v_is_super boolean;
 begin
   select r.rolname into tbl_owner
   from pg_class c join pg_roles r on r.oid = c.relowner
@@ -585,8 +729,31 @@ begin
     raise exception 'lsp_owner_gate_failed: FORCE ROW LEVEL SECURITY is on for public.profiles; a SECURITY DEFINER helper cannot bypass forced RLS (42P17). Run: alter table public.profiles no force row level security;';
   end if;
 
-  if not pg_has_role(current_user, tbl_owner, 'USAGE') then
-    raise exception 'lsp_owner_gate_failed: this session (%) cannot SET ROLE to % (the owner of public.profiles). Run the script as %.', current_user, tbl_owner, tbl_owner;
+  -- Can this session actually SET ROLE to the table owner? Ownership reassignment
+  -- needs exactly that, and revision 6 tested the wrong privilege:
+  --   'USAGE'  = the role's privileges are available WITHOUT SET ROLE. An inherited
+  --              membership satisfies it even when SET ROLE is impossible, so the
+  --              gate could pass and the ALTER then fail with 42501.
+  --   'SET'    = SET ROLE is possible (PostgreSQL 16+, and it honours a membership
+  --              granted WITHOUT SET, which is the case 'USAGE' also accepts).
+  --   'MEMBER' = membership, which before 16 IS the same capability because no SET
+  --              option exists yet.
+  -- Superusers can always SET ROLE to any role, and a session that already IS the
+  -- owner needs no switch, so both count as permitted.
+  v_is_super := coalesce((select r.rolsuper from pg_roles r where r.rolname = current_user), false);
+
+  if v_srv_num >= 160000 then
+    v_can_set := pg_has_role(current_user, tbl_owner, 'SET');
+  else
+    v_can_set := pg_has_role(current_user, tbl_owner, 'MEMBER');
+  end if;
+
+  raise notice 'lsp: server %, membership check %, can_set_role_to_% = % (superuser %, current_user %)',
+    current_setting('server_version'), v_check, tbl_owner, v_can_set, v_is_super, current_user;
+
+  if not (v_can_set or v_is_super or current_user = tbl_owner) then
+    raise exception 'lsp_owner_gate_failed: this session (%) cannot SET ROLE to % (the owner of public.profiles), so ALTER FUNCTION ... OWNER TO % would fail with 42501. Server %, check used %, can_set_role = false. Run the script as % (or as a superuser).',
+      current_user, tbl_owner, tbl_owner, current_setting('server_version'), v_check, tbl_owner;
   end if;
 
   for fn in
@@ -607,6 +774,23 @@ begin
     end if;
   end loop;
 
+  -- Prove the reassignment took effect. ALTER ... OWNER TO can be accepted and
+  -- still leave a different owner, and a SECURITY DEFINER helper owned by the
+  -- wrong role silently fails every policy caller with 42P17 later. Re-read, do
+  -- not assume.
+  for fn in
+    select p.proname, pg_get_userbyid(p.proowner) as owner
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.proname in ('lsp_role','lsp_is_admin','lsp_provider_ids')
+      and pg_get_function_identity_arguments(p.oid) = ''
+  loop
+    if fn.owner <> tbl_owner then
+      raise exception 'lsp_owner_gate_failed: ownership verification failed — public.%() is still owned by % after reassignment (expected %). Aborting: a SECURITY DEFINER helper owned by the wrong role cannot bypass RLS for its callers.',
+        fn.proname, fn.owner, tbl_owner;
+    end if;
+  end loop;
+
   if not exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
                  where n.nspname = 'public' and p.proname = 'lsp_is_admin' and p.prosecdef) then
     raise exception 'lsp_owner_gate_failed: lsp_is_admin() is not SECURITY DEFINER';
@@ -624,6 +808,95 @@ revoke all on function public.lsp_provider_ids() from public, anon;
 grant execute on function public.lsp_role()         to authenticated, service_role;
 grant execute on function public.lsp_is_admin()     to authenticated, service_role;
 grant execute on function public.lsp_provider_ids() to authenticated, service_role;
+
+-- B2.3 RLS DEPENDENCY GATE (provider_profiles).
+--      Two objects above only work if row security is configured the way they
+--      assume, and neither condition was checked in revision 6:
+--
+--        (a) lsp_providers_insert / lsp_providers_update constrain NOTHING unless
+--            RLS is ENABLED on provider_profiles. With RLS off the policies are
+--            inert and any authenticated user can write any provider row — the
+--            opposite of the intent, with no error to notice.
+--
+--        (b) lsp_provider_ids() is SECURITY DEFINER and reads provider_profiles.
+--            A SECURITY DEFINER function bypasses RLS only when its owner owns the
+--            table or holds BYPASSRLS, and FORCE ROW LEVEL SECURITY removes the
+--            owner's exemption. If either is wrong the helper returns ZERO rows
+--            for every caller, lsp_documents_owner matches nothing, and every
+--            provider silently loses access to their own documents. B2.1 aligns
+--            the helpers with the PROFILES owner only, so a provider_profiles
+--            owned by a different role is exactly the case that breaks.
+--
+--      Both states are silent at apply time and expensive later, so this gate
+--      aborts the transaction rather than leaving a notice.
+do $$
+declare
+  v_tbl      text;
+  v_owner    text;
+  v_rls      boolean;
+  v_forced   boolean;
+  v_dep      record;
+  v_fn_owner text;
+  v_bypass   boolean;
+begin
+  -- (a) RLS enabled on every table whose policy this migration writes.
+  foreach v_tbl in array array['profiles','provider_profiles','provider_documents'] loop
+    select c.relrowsecurity, c.relforcerowsecurity, pg_get_userbyid(c.relowner)
+      into v_rls, v_forced, v_owner
+    from pg_class c
+    where c.oid = to_regclass(format('public.%I', v_tbl));
+
+    if not found then
+      raise exception 'lsp_rls_gate_failed: public.%I does not exist, but this migration writes a policy on it. Create it first.', v_tbl;
+    end if;
+
+    if not v_rls then
+      raise exception 'lsp_rls_gate_failed: RLS is DISABLED on public.%I (owner %). The policy this migration creates there would have no effect, so any authenticated user could write any row. Enable it deliberately — alter table public.%I enable row level security; — after checking which rows become invisible to clients, then re-run.',
+        v_tbl, v_owner, v_tbl;
+    end if;
+
+    raise notice 'lsp: RLS enabled on public.% (owner %, force rls %)', v_tbl, v_owner, v_forced;
+  end loop;
+
+  -- (b) Each SECURITY DEFINER helper must be able to bypass RLS on the table it
+  --     reads, or it returns zero rows to every caller.
+  for v_dep in
+    select * from (values
+      ('lsp_role',         'profiles'),
+      ('lsp_is_admin',     'profiles'),
+      ('lsp_provider_ids', 'provider_profiles')
+    ) as t(fn, tbl)
+  loop
+    select pg_get_userbyid(p.proowner) into v_fn_owner
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname = v_dep.fn
+      and pg_get_function_identity_arguments(p.oid) = '';
+
+    select pg_get_userbyid(c.relowner), c.relforcerowsecurity
+      into v_owner, v_forced
+    from pg_class c
+    where c.oid = to_regclass(format('public.%I', v_dep.tbl));
+
+    select coalesce(r.rolbypassrls, false) or coalesce(r.rolsuper, false)
+      into v_bypass
+    from pg_roles r where r.rolname = v_fn_owner;
+
+    if v_forced and not coalesce(v_bypass, false) then
+      raise exception 'lsp_rls_gate_failed: FORCE ROW LEVEL SECURITY is on for public.%I, so %() (SECURITY DEFINER, owner %) cannot bypass RLS and would return zero rows for every caller. Run: alter table public.%I no force row level security;',
+        v_dep.tbl, v_dep.fn, v_fn_owner, v_dep.tbl;
+    end if;
+
+    if v_fn_owner is distinct from v_owner and not coalesce(v_bypass, false) then
+      raise exception 'lsp_rls_gate_failed: %() is owned by %, but public.%I is owned by % and % lacks BYPASSRLS. RLS therefore applies inside the SECURITY DEFINER helper: it returns zero rows for every caller and every policy that calls it denies — providers lose access to their own documents with no error anywhere. Reassign the helper to the table owner, or grant bypassrls deliberately, then re-run.',
+        v_dep.fn, v_fn_owner, v_dep.tbl, v_owner, v_fn_owner;
+    end if;
+
+    raise notice 'lsp: RLS dependency OK — %() owned by % can bypass RLS on public.%',
+      v_dep.fn, v_fn_owner, v_dep.tbl;
+  end loop;
+
+  raise notice 'lsp: RLS dependency gate passed';
+end $$;
 
 -- B3. ROLE ESCALATION GUARD (public.profiles).
 --     RLS is row-scoped, never column-scoped: no policy can stop a self-update of
@@ -935,9 +1208,17 @@ cross join lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
 where n.nspname = 'public' and p.proname like 'lsp\_%'
 order by 1, 2;
 
-select has_function_privilege('anon','public.lsp_is_admin()','EXECUTE') as anon_can_execute,
-       has_function_privilege('authenticated','public.lsp_is_admin()','EXECUTE') as auth_can_execute;
--- expect: anon_can_execute = false, auth_can_execute = true
+--     Same 42883 hazard as A10c: a text signature raises when the function is
+--     absent, so resolve it first. A NULL column here means "not applicable",
+--     never "denied".
+select to_regprocedure('public.lsp_is_admin()') is not null as lsp_is_admin_exists,
+       case when to_regprocedure('public.lsp_is_admin()') is null then null
+            else has_function_privilege('anon', to_regprocedure('public.lsp_is_admin()'), 'EXECUTE')
+       end as anon_can_execute,
+       case when to_regprocedure('public.lsp_is_admin()') is null then null
+            else has_function_privilege('authenticated', to_regprocedure('public.lsp_is_admin()'), 'EXECUTE')
+       end as auth_can_execute;
+-- expect: lsp_is_admin_exists = true, anon_can_execute = false, auth_can_execute = true
 
 -- C6. Constraint present and still NOT VALID (no row scanned or rewritten).
 select conname, convalidated, pg_get_constraintdef(oid) as definition
@@ -1071,13 +1352,44 @@ select count(*) as expected_objects,
 from expected;
 -- expect: expected_objects = 11, matches_b0_claim = true, no_duplicates = true
 
+-- C9. RLS DEPENDENCY, POST-MIGRATION. Read-only mirror of B2.3: B2.3 aborts when
+--     the state is wrong, C9 shows what the state actually is.
+--     provider_profiles must have RLS ENABLED or lsp_providers_insert /
+--     lsp_providers_update constrain nothing; each SECURITY DEFINER helper must
+--     be able to bypass RLS on the table it reads, or it returns zero rows and
+--     every policy calling it denies.
+select c.relname,
+       c.relrowsecurity as rls_enabled,
+       c.relforcerowsecurity as rls_forced,
+       pg_get_userbyid(c.relowner) as table_owner
+from pg_class c join pg_namespace n on n.oid = c.relnamespace
+where n.nspname = 'public'
+  and c.relname in ('profiles','provider_profiles','provider_documents')
+order by c.relname;
+-- expect: rls_enabled = true for all three, rls_forced = false
+
+select p.proname,
+       pg_get_userbyid(p.proowner) as helper_owner,
+       coalesce(r.rolbypassrls, false) as owner_bypassrls,
+       coalesce(r.rolsuper, false) as owner_superuser,
+       case p.proname when 'lsp_provider_ids' then 'provider_profiles' else 'profiles' end as reads_table
+from pg_proc p
+join pg_namespace n on n.oid = p.pronamespace
+left join pg_roles r on r.oid = p.proowner
+where n.nspname = 'public'
+  and p.proname in ('lsp_role','lsp_is_admin','lsp_provider_ids')
+order by p.proname;
+-- expect: for each row, helper_owner = the owner of reads_table, or
+--         owner_bypassrls / owner_superuser = true
+
 
 -- ============================================================================
 -- SECTION D — ROLLBACK (only if a real regression appears)
 -- ----------------------------------------------------------------------------
--- THIS IS NOT AUTOMATIC. It restores what A0/A0b/A0e/A0f recorded and nothing
--- else. Without that saved output, D.1 can remove the new objects but cannot put
--- the old ones back. Every line is a comment until you deliberately uncomment it.
+-- THIS IS NOT AUTOMATIC. It restores what A0, A0b, A0c, A0e, A0f, A0g and A0h
+-- recorded and nothing else. Without that saved output, D.1 can remove the new
+-- objects but cannot put a pre-existing one back. Every line is a comment until
+-- you deliberately uncomment it, and each one names the A0h row that licenses it.
 -- ============================================================================
 
 -- D.1  RESTORE. Fill in R1-R4 from A0b/A0f, A0, A0e, then uncomment the block.
