@@ -1443,45 +1443,54 @@ order by p.proname;
 -- drop policy if exists lsp_providers_update on public.provider_profiles;             -- A0h false only
 -- drop policy if exists lsp_documents_owner  on public.provider_documents;            -- A0h false only
 
--- D.1.2 RESTORE THE THREE REPLACED HELPERS (R1-R4). These always pre-exist, so
---       they are never dropped — many policies call them and dropping them would
---       break every one of those policies.
+-- D.1.2 RESTORE THE FOUR POLICIES AND THE THREE HELPERS (R1-R4). The helpers
+--       always pre-exist, so they are never dropped — many policies call them and
+--       dropping them would break every one of those policies. Policies are
+--       dropped by D.1.1 only when A0h says B created them; when one pre-existed,
+--       B replaced it and R1 puts the captured definition back.
 --
--- -- R1 <paste the CREATE OR REPLACE FUNCTION statements for lsp_role,
+-- -- R1 <four CREATE POLICY statements from A0f (raw rows: A0b), with
+-- --      permissive/roles/cmd/qual/with_check exactly as captured. Run
+-- --      "drop policy if exists <name> on <table>;" first for each: CREATE POLICY
+-- --      has no OR REPLACE, so recreating without the drop fails with 42710. If
+-- --      A0h says a policy was absent before B, D.1.1 already removed it and
+-- --      there is nothing to restore for that row.>
+--
+-- -- R2 <paste the CREATE OR REPLACE FUNCTION statements for lsp_role,
 -- --      lsp_is_admin and lsp_provider_ids from A0's definition column.
 -- --      pg_get_functiondef output includes the SET search_path clauses and the
 -- --      SECURITY DEFINER bit, so those come back with the body. It does NOT
--- --      include the owner or the ACL — those are R2 and R3.>
+-- --      include the owner or the ACL — those are R3 and R4.>
 --
--- -- R2 <for each of the three, restore the owner recorded by A0's owner column:
+-- -- R3 <for each of the three, restore the owner recorded by A0's owner column:
 -- --      alter function public.lsp_role() owner to <owner-from-A0>;
 -- --      Needs the same SET ROLE privilege B2.1 required.>
 --
--- -- R3 <restore the ACL recorded by A0's acl column, using A0e's rendered
+-- -- R4 <restore the ACL recorded by A0's acl column, using A0e's rendered
 -- --      statements. Restore EXACTLY, which means revoking first: PostgreSQL
 -- --      grants EXECUTE on a new function to PUBLIC, so a plain re-grant would
 -- --      leave a PUBLIC grant that did not exist before.
 -- --        revoke all on function public.lsp_role() from public, anon, authenticated, service_role;
 -- --        <then replay A0e's grant lines for that function>>
 
--- D.1.3 RESTORE PRE-EXISTING OBJECTS (R4-R6). Run only the lines whose A0h row
+-- D.1.3 RESTORE PRE-EXISTING OBJECTS (R5-R7). Run only the lines whose A0h row
 --       says pre_existing = true. Order: function before the trigger that calls
 --       it, trigger before its table is used again.
 --
--- -- R4 <guard function, if A0h: true. Paste A0's pg_get_functiondef for it, then
--- --      restore owner and ACL exactly as R2/R3 do for the helpers:
+-- -- R5 <guard function, if A0h: true. Paste A0's pg_get_functiondef for it, then
+-- --      restore owner and ACL exactly as R3/R4 do for the helpers:
 -- --        alter function public.lsp_guard_profile_role() owner to <A0 owner>;
 -- --        revoke all on function public.lsp_guard_profile_role() from public, anon, authenticated, service_role;
 -- --        <replay A0e grant lines for that function>>
 --
--- -- R5 <trigger, if A0h: true. Paste A0c's restore_statement verbatim: it
+-- -- R6 <trigger, if A0h: true. Paste A0c's restore_statement verbatim: it
 -- --      carries the definition AND the enabled state, because a trigger captured
 -- --      as tgenabled = 'D' must come back DISABLED.
 -- --        <A0c definition>;  alter table public.profiles disable trigger lsp_guard_profile_role;
 -- --      tgenabled = 'O' needs no second statement; 'R' and 'A' each have their
 -- --      own and A0c emits the right one.>
 --
--- -- R6 <constraint, if A0h: true. Paste A0g's restore_statement verbatim:
+-- -- R7 <constraint, if A0h: true. Paste A0g's restore_statement verbatim:
 -- --        alter table public.profiles add constraint profiles_role_allowed <definition>;
 -- --      pg_get_constraintdef emits NOT VALID when the captured constraint was
 -- --      unvalidated, so validation state returns with the definition. Compare
@@ -1520,13 +1529,13 @@ order by p.proname;
 --
 -- | # | object                                  | before B      | effect of B | restore | recoverable from |
 -- |---|-----------------------------------------|---------------|-------------|---------|------------------|
--- | 1 | trigger lsp_guard_profile_role          | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R5 | YES — A0c definition + tgenabled |
--- | 2 | trigger lsp_guard_provider_verification | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R5 | YES — A0c definition + tgenabled |
--- | 3 | trigger lsp_guard_document_status       | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R5 | YES — A0c definition + tgenabled |
--- | 4 | function lsp_guard_profile_role         | A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R4 | YES — A0 definition, owner, ACL |
--- | 5 | function lsp_guard_provider_verification| A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R4 | YES — A0 definition, owner, ACL |
--- | 6 | function lsp_guard_document_status      | A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R4 | YES — A0 definition, owner, ACL |
--- | 7 | constraint profiles_role_allowed        | A0g: absent, or present (B leaves a same-named one untouched) | created NOT VALID if absent; unchanged if present | A0h false: drop (D.1.1); A0h true: R6 | YES — A0g definition + convalidated; no row scanned or rewritten |
+-- | 1 | trigger lsp_guard_profile_role          | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R6 | YES — A0c definition + tgenabled |
+-- | 2 | trigger lsp_guard_provider_verification | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R6 | YES — A0c definition + tgenabled |
+-- | 3 | trigger lsp_guard_document_status       | A0c: absent or pre-existing | created, or overwritten if pre-existing | A0h false: drop (D.1.1); A0h true: R6 | YES — A0c definition + tgenabled |
+-- | 4 | function lsp_guard_profile_role         | A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R5 | YES — A0 definition, owner, ACL |
+-- | 5 | function lsp_guard_provider_verification| A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R5 | YES — A0 definition, owner, ACL |
+-- | 6 | function lsp_guard_document_status      | A0: absent or pre-existing | created, or body overwritten by CREATE OR REPLACE | A0h false: drop (D.1.1); A0h true: R5 | YES — A0 definition, owner, ACL |
+-- | 7 | constraint profiles_role_allowed        | A0g: absent, or present (B leaves a same-named one untouched) | created NOT VALID if absent; unchanged if present | A0h false: drop (D.1.1); A0h true: R7 | YES — A0g definition + convalidated; no row scanned or rewritten |
 -- | 8 | policy lsp_profiles_insert              | A0b row or absent | replaced | drop + R1 | YES — A0b/A0f, exactly |
 -- | 9 | policy lsp_providers_insert             | A0b row (expected live) | replaced | drop + R1 | YES — A0b/A0f, exactly |
 -- |10 | policy lsp_providers_update             | A0b row or absent | replaced | drop + R1 | YES — A0b/A0f, exactly |
