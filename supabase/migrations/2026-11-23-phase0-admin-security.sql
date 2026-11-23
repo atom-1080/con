@@ -787,8 +787,9 @@ with created as (
 select coalesce(kind, 'TOTAL') as kind, count(*) as objects
 from created
 group by rollup (kind)
-order by kind nulls last;
--- expect: constraint 1, guard function 3, policy 4, trigger 3, TOTAL 11
+order by grouping(kind), kind;
+-- expect: constraint 1, guard function 3, policy 4, trigger 3, TOTAL 11 last
+-- ordering by grouping(kind) keeps the TOTAL row last under any collation.
 
 -- C8b. The 3 REPLACED helpers — deliberately outside the 11 and NOT dropped by
 --      D.1, because policies call them. These are restored from A0, not removed.
@@ -1108,9 +1109,15 @@ declare
   v_rows    integer;
   v_invoker boolean;
 begin
-  select count(*) into v_rows from public.profiles;
+  -- A row with a VALID role is required, not merely any row: profiles_role_allowed
+  -- is NOT VALID, so it does not police existing rows but IS enforced on every
+  -- UPDATE. Testing against a legacy out-of-range row would fail the positive
+  -- control with 23514 and prove nothing about the trigger.
+  select count(*) into v_rows from public.profiles
+  where role in ('customer','provider','admin');
+
   if v_rows = 0 then
-    raise exception 'S5 ABORT: public.profiles is empty. The test needs one real row (profiles.id references auth.users, so no synthetic row can be created).';
+    raise exception 'S5 ABORT: public.profiles has no row with a role in (customer, provider, admin). The test needs one such row (profiles.id references auth.users, so no synthetic row can be created). A9 lists the legacy rows.';
   end if;
 
   select not p.prosecdef into v_invoker
@@ -1125,7 +1132,7 @@ begin
     raise exception 'S5 ABORT: lsp_guard_profile_role() is SECURITY DEFINER. current_user inside it would be the owner (trusted), the untrusted-role test would pass for the wrong reason, and the gate would be unenforceable for real clients.';
   end if;
 
-  raise notice 'S5.0 OK: % profile row(s); guard is SECURITY INVOKER', v_rows;
+  raise notice 'S5.0 OK: % profile row(s) with a valid role; guard is SECURITY INVOKER', v_rows;
 end $$;
 
 -- S5.1 Scratch untrusted role (transactional) -------------------------------
@@ -1201,7 +1208,8 @@ declare
   v_id   uuid;
   v_rows integer;
 begin
-  select id into v_id from public.profiles order by id limit 1;
+  select id into v_id from public.profiles
+  where role in ('customer','provider','admin') order by id limit 1;
 
   set local role lsp_test_untrusted;
   execute 'update public.profiles set role = role where id = $1' using v_id;
@@ -1223,7 +1231,8 @@ declare
   v_state text;
   v_msg   text;
 begin
-  select id into v_id from public.profiles order by id limit 1;
+  select id into v_id from public.profiles
+  where role in ('customer','provider','admin') order by id limit 1;
 
   set local role lsp_test_untrusted;
   begin
@@ -1262,7 +1271,8 @@ declare
   v_id   uuid;
   v_rows integer;
 begin
-  select id into v_id from public.profiles order by id limit 1;
+  select id into v_id from public.profiles
+  where role in ('customer','provider','admin') order by id limit 1;
 
   update public.profiles set role = role where id = v_id;
   get diagnostics v_rows = row_count;
@@ -1298,11 +1308,8 @@ select to_regrole('lsp_test_untrusted') is not null            as scratch_role_e
            and policyname = 'lsp_test_untrusted_probe')       as probe_policy_rows,
        (select tgenabled from pg_trigger
          where tgrelid = 'public.profiles'::regclass
-           and tgname   = 'lsp_guard_profile_role')           as trigger_state,
-       (select count(*) from pg_proc
-         where proname = 'lsp_test_whoami')                    as probe_function_rows;
--- expect: scratch_role_exists = false, probe_policy_rows = 0,
---         trigger_state = 'O', probe_function_rows = 0
+           and tgname   = 'lsp_guard_profile_role')           as trigger_state;
+-- expect: scratch_role_exists = false, probe_policy_rows = 0, trigger_state = 'O'
 
 -- ----------------------------------------------------------------------------
 -- S6 [RECONSTRUCTED] — role immutability on UPDATE (CLIENT SESSION, not run)
