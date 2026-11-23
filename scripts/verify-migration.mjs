@@ -58,21 +58,30 @@ check(
   /allow_preexisting_objects/.test(src),
 );
 
-// A0h must enumerate all 14 objects B touches (11 created + 3 replaced).
+// A0h must enumerate all 14 objects B touches (11 created + 3 replaced). The
+// register is live SQL: a `with expected(...) as (values ...)` list, one row per
+// object, so it is counted from the VALUES rows rather than from comment text.
 const a0hStart = lines.findIndex((l) => /^-- A0h\./.test(l));
-const b0bStart = lines.findIndex((l) => /^-- B0b\./.test(l));
-check('A0h precedes B0b', a0hStart !== -1 && b0bStart !== -1 && a0hStart < b0bStart);
-if (a0hStart !== -1 && b0bStart !== -1) {
-  const register = lines.slice(a0hStart, b0bStart).join('\n');
-  const numbers = [...register.matchAll(/^--\s*\|\s*(\d+)\s*\|/gm)].map((m) => Number(m[1]));
-  const contiguous =
-    numbers.length === 14 && numbers.every((n, i) => n === i + 1);
+const presentIdx = lines.findIndex(
+  (l, i) => i > a0hStart && /^present\(kind, name, on_object\) as \(/.test(l),
+);
+check('A0h register located', a0hStart !== -1 && presentIdx > a0hStart);
+if (a0hStart !== -1 && presentIdx > a0hStart) {
+  const register = lines.slice(a0hStart, presentIdx).join('\n');
+  const created = (register.match(/\('created'/g) ?? []).length;
+  const replaced = (register.match(/\('replaced'/g) ?? []).length;
   check(
-    'A0h lists exactly 14 objects, numbered 1-14',
-    contiguous,
-    `found ${numbers.length}: ${numbers.join(',') || 'none'}`,
+    'A0h enumerates 11 created + 3 replaced objects (14 total)',
+    created === 11 && replaced === 3,
+    `created=${created}, replaced=${replaced}`,
   );
-  check('A0h distinguishes RESTORE from DROP', /RESTORE/.test(register));
+  check('A0h reports a rollback_action', /rollback_action/.test(register));
+  check(
+    'A0h covers triggers, guard functions, policies and the constraint',
+    ['trigger', 'guard function', 'policy', 'constraint'].every((k) =>
+      register.includes(`'${k}'`),
+    ),
+  );
 }
 
 for (const stage of ['D.1.1', 'D.1.2', 'D.1.3', 'D.1.4', 'D.1.5']) {
@@ -162,7 +171,7 @@ for (const fn of [
   'lsp_guard_provider_verification',
   'lsp_guard_document_status',
 ]) {
-  check(`guard function ${fn} defined`, src.includes(`function public.${fn}`) || src.includes(fn));
+  check(`guard function ${fn} present`, src.includes(fn));
 }
 
 // --- limitations must remain explicit -------------------------------------
