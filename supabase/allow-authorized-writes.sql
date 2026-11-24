@@ -307,6 +307,10 @@ create policy lsp_profiles_update on public.profiles for update to authenticated
   using (id = auth.uid() or public.lsp_is_admin())
   with check (id = auth.uid() or public.lsp_is_admin());
 
+-- NOTE: this policy is row-scoped only. It does not stop a self-update of
+-- {"role":"admin"}. Apply supabase/migrations/2026-11-24-role-guard-and-services-scope.sql
+-- (or the identical trigger in supabase/schema.sql) to close that hole.
+
 -- ---------------------------------------------------------------------------
 -- 6. provider_profiles — providers create and edit their own listing
 -- ---------------------------------------------------------------------------
@@ -339,14 +343,18 @@ create policy lsp_documents_owner on public.provider_documents for all to authen
   with check (provider_id = auth.uid() or public.lsp_is_admin());
 
 -- ---------------------------------------------------------------------------
--- 8. services — shared catalogue: any authorised user may add details
+-- 8. services — shared catalogue, owner-or-admin writes.
+--    This section previously read `using (true) with check (true)`, which let
+--    any signed-in customer insert, rewrite or delete catalogue rows. That form
+--    must never be re-applied. This now matches supabase/schema.sql.
 -- ---------------------------------------------------------------------------
 drop policy if exists lsp_services_read on public.services;
 create policy lsp_services_read on public.services for select using (true);
 
 drop policy if exists lsp_services_write on public.services;
 create policy lsp_services_write on public.services for all to authenticated
-  using (true) with check (true);
+  using (provider_id in (select public.lsp_provider_ids()) or public.lsp_is_admin())
+  with check (provider_id in (select public.lsp_provider_ids()) or public.lsp_is_admin());
 
 -- ---------------------------------------------------------------------------
 -- 9. service_categories — readable by all, maintained by admins

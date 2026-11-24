@@ -6,6 +6,80 @@ export function isAdminRole(role) {
   return String(role || '').trim().toLowerCase() === 'admin';
 }
 
+/* ------------------------------------------------------- authorization model */
+// Mirrors the database rules in
+// supabase/migrations/2026-11-24-role-guard-and-services-scope.sql so the same
+// decisions can be unit tested without a live database. The database remains
+// the authority: these helpers only keep the UI from offering an action the
+// server would refuse.
+
+export const PROFILE_ROLES = ['customer', 'provider', 'admin'];
+
+// Signed document URLs are an administrator-only capability.
+export function canMintDocumentLink(role) {
+  return isAdminRole(role);
+}
+
+// `trustedProcess` represents the SQL Editor / service_role path, the only one
+// the guard trigger allows to change a role. No browser session can set it.
+export function resolveProfileRoleChange({
+  actorId,
+  targetId,
+  currentRole,
+  nextRole,
+  trustedProcess = false,
+} = {}) {
+  const current = String(currentRole || 'customer').trim().toLowerCase() || 'customer';
+  const next =
+    nextRole === undefined || nextRole === null || nextRole === ''
+      ? current
+      : String(nextRole).trim().toLowerCase();
+
+  if (next === current) return { allowed: true, persistedRole: current, reason: '' };
+
+  if (!PROFILE_ROLES.includes(next)) {
+    return { allowed: false, persistedRole: current, reason: `Unknown role: ${next}.` };
+  }
+
+  const sameUser = String(actorId || '') !== '' && String(actorId) === String(targetId || '');
+  if (sameUser && !trustedProcess) {
+    return {
+      allowed: false,
+      persistedRole: current,
+      reason: 'You cannot change your own role. Ask an administrator to provision it.',
+    };
+  }
+
+  if (!trustedProcess) {
+    return {
+      allowed: false,
+      persistedRole: current,
+      reason: 'Roles can only be changed by a trusted administrative process.',
+    };
+  }
+
+  return { allowed: true, persistedRole: next, reason: '' };
+}
+
+// Owner-or-admin, matching the lsp_services_write policy. When the catalogue has
+// no owner column the policy is admin-only, so a provider row is refused there
+// and provider catalogue work happens in provider_skills instead.
+export function canWriteServiceRow({
+  role,
+  providerIds = [],
+  row = {},
+  hasOwnerColumn = true,
+} = {}) {
+  if (isAdminRole(role)) return true;
+  if (!hasOwnerColumn) return false;
+  if (String(role || '').trim().toLowerCase() !== 'provider') return false;
+
+  const owner = String(row?.providerId ?? row?.provider_id ?? '').trim();
+  if (!owner) return false; // an unowned catalogue row is admin-only
+
+  return (Array.isArray(providerIds) ? providerIds : []).map((id) => String(id)).includes(owner);
+}
+
 /* ------------------------------------------------------------- validation */
 
 export function validateCategoryInput({ name } = {}, existing = [], currentId = '') {

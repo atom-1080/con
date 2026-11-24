@@ -305,6 +305,55 @@ create policy lsp_profiles_update on public.profiles for update to authenticated
   using (id = auth.uid() or public.lsp_is_admin())
   with check (id = auth.uid() or public.lsp_is_admin());
 
+-- Role escalation guard. RLS is row-scoped and has no column-level policies, so
+-- lsp_profiles_update alone cannot stop a self-update of {"role":"admin"}. Only
+-- a BEFORE trigger sees OLD and NEW. The role is pinned on UPDATE (so
+-- api.js ensureProfile(), which echoes `role` on every save, keeps working) and
+-- new rows are limited to customer/provider. Privileged role changes happen only
+-- through the trusted administrative process (SQL Editor / service_role).
+-- Mirrors supabase/migrations/2026-11-24-role-guard-and-services-scope.sql.
+create or replace function public.lsp_guard_profile_role()
+returns trigger language plpgsql security invoker
+set search_path = pg_catalog, public as $$
+declare
+  api_role text := current_user;
+  trusted  constant text[] := array['postgres','supabase_admin','supabase_storage_admin','supabase_auth_admin','service_role'];
+begin
+  if api_role = any (trusted) then
+    return new;
+  end if;
+
+  if api_role <> 'authenticated' then
+    raise exception 'lsp_write_denied: role % may not write public.profiles', api_role
+      using errcode = '42501';
+  end if;
+
+  if (select auth.uid()) is null then
+    raise exception 'lsp_write_denied: authenticated session without a subject'
+      using errcode = '42501';
+  end if;
+
+  if tg_op = 'INSERT' then
+    if new.role is null then
+      new.role := 'customer';
+    end if;
+    if new.role not in ('customer','provider') then
+      raise exception 'lsp_role_escalation_blocked: cannot create a profile with role %', new.role
+        using errcode = '42501';
+    end if;
+    return new;
+  end if;
+
+  if new.role is distinct from old.role then
+    new.role := old.role;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists lsp_guard_profile_role on public.profiles;
+create trigger lsp_guard_profile_role before insert or update on public.profiles
+  for each row execute function public.lsp_guard_profile_role();
+
 -- categories: readable by everyone, maintained by admins
 drop policy if exists lsp_categories_read on public.service_categories;
 create policy lsp_categories_read on public.service_categories for select using (true);

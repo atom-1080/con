@@ -17,6 +17,7 @@ import {
   pick,
 } from './rows.js';
 import {
+  canMintDocumentLink,
   computeDashboardMetrics,
   isPendingVerification,
   summarizePayments,
@@ -461,6 +462,21 @@ export async function reviewVerification(providerKey, decision, documentIds = []
 // Private documents live in Supabase Storage. A stored path is exchanged for a
 // short-lived signed URL; a full http(s) URL is used unchanged.
 export async function documentLink(fileUrl) {
+  // Signed document URLs are administrator-only. requireAdmin() re-reads the
+  // role from the database, so a non-admin session cannot mint one even if it
+  // calls this function directly. Storage policies gate the object as well.
+  try {
+    const { profile } = await requireAdmin();
+    if (!canMintDocumentLink(profile?.role)) {
+      return { url: '', error: 'Administrator access is required to open provider documents.' };
+    }
+  } catch (error) {
+    return {
+      url: '',
+      error: error?.message || 'Administrator access is required to open provider documents.',
+    };
+  }
+
   const value = String(fileUrl || '').trim();
   if (!value) return { url: '', error: 'This document has no file attached.' };
   if (/^https?:\/\//i.test(value)) return { url: value, error: '' };
