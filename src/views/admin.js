@@ -1385,7 +1385,7 @@ async function renderPayments(root, ctx) {
             <td class="muted">${esc(row.method || '—')}</td>
             <td>${esc(row.amount === null || row.amount === undefined ? '—' : money(row.amount))}</td>
             <td class="muted">${esc(row.createdAt ? formatDate(row.createdAt) : '—')}</td>
-            <td>${statusBadge(row.status)}${isPaidStatus(row.status) ? '' : ''}</td>
+            <td>${statusBadge(row.status)}</td>
             <td><button class="btn sm ghost" data-focus="${esc(row.id)}">View</button></td>
           </tr>`,
         ),
