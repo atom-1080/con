@@ -205,6 +205,16 @@ test('an admin may generate document links', () => {
 
 /* ------------------------------------------------------------- SQL contract */
 
+// Comments cannot grant privileges, so policy assertions are made against
+// executable SQL only: line and block comments are stripped first. The rollback
+// and trigger assertions below deliberately use the raw text.
+const executableSql = (text) =>
+  String(text)
+    .replace(/--[^\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+
+const migrationSql = executableSql(migration);
+
 test('the migration installs the role guard as a BEFORE row trigger', () => {
   assert.match(migration, /create trigger lsp_guard_profile_role before insert or update on public\.profiles/i);
   assert.match(migration, /drop trigger if exists lsp_guard_profile_role on public\.profiles/i);
@@ -223,9 +233,12 @@ test('the guard only trusts the administrative allowlist', () => {
 });
 
 test('the migration contains no permissive services write policy', () => {
-  assert.doesNotMatch(migration, /using \(true\) with check \(true\)/i);
-  assert.match(migration, /drop policy if exists lsp_services_write on public\.services/i);
-  assert.match(migration, /provider_id in \(select public\.lsp_provider_ids\(\)\) or public\.lsp_is_admin\(\)/i);
+  assert.doesNotMatch(migrationSql, /using \(true\) with check \(true\)/i);
+  assert.match(migrationSql, /drop policy if exists lsp_services_write on public\.services/i);
+  assert.match(
+    migrationSql,
+    /provider_id in \(select public\.lsp_provider_ids\(\)\) or public\.lsp_is_admin\(\)/i,
+  );
 });
 
 test('the migration fails closed when the helper functions are missing', () => {
@@ -246,7 +259,7 @@ test('schema.sql protects fresh installs with the same guard trigger', () => {
 });
 
 test('the permissive services policy is gone from allow-authorized-writes.sql', () => {
-  const servicesWrite = permissiveScript.match(
+  const servicesWrite = executableSql(permissiveScript).match(
     /create policy lsp_services_write on public\.services[\s\S]{0,240}?;/i,
   );
   assert.ok(servicesWrite, 'lsp_services_write should still be defined');
@@ -255,7 +268,9 @@ test('the permissive services policy is gone from allow-authorized-writes.sql', 
 });
 
 test('both schema scripts keep the services write policy owner-or-admin', () => {
-  const schemaPolicy = schemaSql.match(/create policy lsp_services_write on public\.services[\s\S]{0,240}?;/i);
+  const schemaPolicy = executableSql(schemaSql).match(
+    /create policy lsp_services_write on public\.services[\s\S]{0,240}?;/i,
+  );
   assert.ok(schemaPolicy, 'schema.sql should define lsp_services_write');
   assert.doesNotMatch(schemaPolicy[0], /using \(true\)/i);
   assert.match(schemaPolicy[0], /lsp_is_admin\(\)/i);
