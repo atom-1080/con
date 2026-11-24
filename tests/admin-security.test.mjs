@@ -18,12 +18,16 @@ import { readFileSync } from 'node:fs';
 import {
   canMintDocumentLink,
   canWriteServiceRow,
+  isTrustedAdminSession,
   resolveProfileRoleChange,
+  roleWriteDecision,
 } from '../src/lib/adminValidation.js';
 
 const read = (relative) => readFileSync(new URL(relative, import.meta.url), 'utf8');
 
 const migration = read('../supabase/migrations/2026-11-24-role-guard-and-services-scope.sql');
+// The 2026-11-25 migration supersedes the guard from the file above.
+const guardMigration = read('../supabase/migrations/2026-11-25-role-guard-trusted-session.sql');
 const schemaSql = read('../supabase/schema.sql');
 const permissiveScript = read('../supabase/allow-authorized-writes.sql');
 
@@ -132,6 +136,184 @@ test('an unknown role value is rejected rather than stored', () => {
   assert.equal(result.persistedRole, 'customer');
 });
 
+/* --------------------------------------- trusted-session guard (model) */
+// Reproduces, without a database, the identity pairs PostgreSQL actually
+// presents. The SECURITY DEFINER rows are the reported bypass: current_user is
+// the function owner while session_user is still the caller's login role.
+
+const CUSTOMER_SESSION = { sessionUser: 'authenticator', currentUser: 'authenticated', apiRequest: true };
+const DEFINER_OWNED_BY_POSTGRES = { sessionUser: 'authenticator', currentUser: 'postgres', apiRequest: true };
+const SQL_EDITOR = { sessionUser: 'postgres', currentUser: 'postgres', apiRequest: false, isSuperuser: true };
+
+test('a customer cannot self-promote by direct profile update', () => {
+  const result = roleWriteDecision({
+    ...CUSTOMER_SESSION,
+    operation: 'update',
+    oldRole: 'customer',
+    newRole: 'admin',
+  });
+
+  assert.equal(result.action, 'pin');
+  assert.equal(result.persistedRole, 'customer');
+});
+
+test('a provider cannot self-promote by direct profile update', () => {
+  const result = roleWriteDecision({
+    ...CUSTOMER_SESSION,
+    operation: 'update',
+    oldRole: 'provider',
+    newRole: 'admin',
+  });
+
+  assert.equal(result.action, 'pin');
+  assert.equal(result.persistedRole, 'provider');
+});
+
+test('self-promotion through an upsert is refused before conflict resolution', () => {
+  const result = roleWriteDecision({
+    ...CUSTOMER_SESSION,
+    operation: 'insert',
+    oldRole: null,
+    newRole: 'admin',
+  });
+
+  assert.equal(result.action, 'deny');
+  assert.equal(result.code, '42501');
+});
+
+test('self-promotion through a SECURITY DEFINER RPC owned by postgres is pinned', () => {
+  // Inside the function current_user is postgres; session_user is still the
+  // caller's login role, so no administration session is in effect.
+  assert.equal(isTrustedAdminSession({ ...DEFINER_OWNED_BY_POSTGRES, isSuperuser: true }), false);
+
+  const update = roleWriteDecision({
+    ...DEFINER_OWNED_BY_POSTGRES,
+    isSuperuser: true,
+    operation: 'update',
+    oldRole: 'customer',
+    newRole: 'admin',
+  });
+  assert.equal(update.action, 'pin');
+  assert.equal(update.persistedRole, 'customer');
+
+  const insert = roleWriteDecision({
+    ...DEFINER_OWNED_BY_POSTGRES,
+    isSuperuser: true,
+    operation: 'insert',
+    newRole: 'admin',
+  });
+  assert.equal(insert.action, 'deny');
+  assert.equal(insert.code, '42501');
+});
+
+test('an ordinary profile update that echoes the role still succeeds', () => {
+  const echoed = roleWriteDecision({
+    ...CUSTOMER_SESSION,
+    operation: 'update',
+    oldRole: 'customer',
+    newRole: 'customer',
+  });
+  assert.equal(echoed.action, 'allow');
+  assert.equal(echoed.persistedRole, 'customer');
+
+  const omitted = roleWriteDecision({
+    ...CUSTOMER_SESSION,
+    operation: 'update',
+    oldRole: 'provider',
+    newRole: null,
+  });
+  assert.equal(omitted.action, 'allow');
+  assert.equal(omitted.persistedRole, 'provider');
+});
+
+test('a trusted SQL Editor session may provision an administrator', () => {
+  assert.equal(isTrustedAdminSession(SQL_EDITOR), true);
+
+  const result = roleWriteDecision({
+    ...SQL_EDITOR,
+    operation: 'update',
+    oldRole: 'customer',
+    newRole: 'admin',
+  });
+  assert.equal(result.action, 'allow');
+  assert.equal(result.persistedRole, 'admin');
+});
+
+test('a service_role API request cannot change a role', () => {
+  const result = roleWriteDecision({
+    sessionUser: 'authenticator',
+    currentUser: 'service_role',
+    apiRequest: true,
+    isProvisioner: true,
+    operation: 'update',
+    oldRole: 'customer',
+    newRole: 'admin',
+  });
+
+  assert.equal(result.action, 'pin');
+  assert.equal(result.persistedRole, 'customer');
+});
+
+test('provisioner membership cannot survive an elevation', () => {
+  // An API role with membership is still an API role.
+  assert.equal(
+    isTrustedAdminSession({
+      sessionUser: 'authenticator',
+      currentUser: 'authenticated',
+      apiRequest: true,
+      isProvisioner: true,
+    }),
+    false,
+  );
+
+  // A definer function that switched identity no longer matches session_user.
+  assert.equal(
+    isTrustedAdminSession({
+      sessionUser: 'postgres',
+      currentUser: 'authenticated',
+      apiRequest: false,
+      isProvisioner: true,
+    }),
+    false,
+  );
+});
+
+test('an explicit provisioner session on a direct connection is trusted', () => {
+  assert.equal(
+    isTrustedAdminSession({
+      sessionUser: 'lsp_provisioner_ops',
+      currentUser: 'lsp_provisioner_ops',
+      apiRequest: false,
+      isProvisioner: true,
+    }),
+    true,
+  );
+
+  const result = roleWriteDecision({
+    sessionUser: 'lsp_provisioner_ops',
+    currentUser: 'lsp_provisioner_ops',
+    isProvisioner: true,
+    operation: 'update',
+    oldRole: 'provider',
+    newRole: 'admin',
+  });
+  assert.equal(result.persistedRole, 'admin');
+});
+
+test('the API login role is refused rather than guessed at', () => {
+  const result = roleWriteDecision({
+    sessionUser: 'authenticator',
+    currentUser: 'authenticator',
+    apiRequest: true,
+    operation: 'update',
+    oldRole: 'customer',
+    newRole: 'admin',
+  });
+
+  assert.equal(result.action, 'deny');
+  assert.equal(result.code, '42501');
+});
+
 /* ------------------------------------------------------ services (model) */
 
 test('a customer cannot create, modify or delete services', () => {
@@ -215,21 +397,45 @@ const executableSql = (text) =>
 
 const migrationSql = executableSql(migration);
 
-test('the migration installs the role guard as a BEFORE row trigger', () => {
-  assert.match(migration, /create trigger lsp_guard_profile_role before insert or update on public\.profiles/i);
-  assert.match(migration, /drop trigger if exists lsp_guard_profile_role on public\.profiles/i);
-  assert.match(migration, /create or replace function public\.lsp_guard_profile_role\(\)/i);
+test('the guard migration installs the role guard as a BEFORE row trigger', () => {
+  assert.match(guardMigration, /create trigger lsp_guard_profile_role\s+before insert or update on public\.profiles/i);
+  assert.match(guardMigration, /drop trigger if exists lsp_guard_profile_role on public\.profiles/i);
+  assert.match(guardMigration, /create or replace function public\.lsp_guard_profile_role\(\)/i);
+  assert.match(guardMigration, /security invoker/i);
 });
 
 test('the guard pins the role on update and rejects privileged inserts', () => {
-  assert.match(migration, /new\.role := old\.role/);
-  assert.match(migration, /new\.role not in \('customer','provider'\)/);
-  assert.match(migration, /using errcode = '42501'/);
+  assert.match(guardMigration, /new\.role := old\.role/);
+  assert.match(guardMigration, /new\.role not in \('customer',\s*'provider'\)/);
+  assert.match(guardMigration, /using errcode = '42501'/);
 });
 
-test('the guard only trusts the administrative allowlist', () => {
-  assert.match(migration, /array\['postgres','supabase_admin','supabase_storage_admin','supabase_auth_admin','service_role'\]/);
-  assert.match(migration, /if api_role <> 'authenticated' then/);
+test('the guard decides trust from session identity, not the effective role', () => {
+  // The fix: an elevation of any kind (SECURITY DEFINER, SET ROLE) makes these
+  // two differ, and the guard then treats the caller as an app caller.
+  assert.match(guardMigration, /v_session\s+text := session_user/);
+  assert.match(guardMigration, /v_current\s+text := current_user/);
+  assert.match(guardMigration, /v_session = v_current/);
+  assert.match(guardMigration, /v_current not in \('anon', 'authenticated'/);
+  assert.match(guardMigration, /pg_has_role\(v_current, 'lsp_role_provisioner', 'MEMBER'\)/);
+  assert.match(guardMigration, /bool_or\(r\.rolsuper\)/);
+});
+
+test('the guard treats API request GUCs as a disqualifier only', () => {
+  assert.match(guardMigration, /current_setting\('request\.jwt\.claims', true\)/);
+  assert.match(guardMigration, /current_setting\('request\.method', true\)/);
+  // Presence disqualifies: the flag is only ever used to remove trust.
+  assert.match(guardMigration, /if not v_api_request and v_session = v_current then/);
+});
+
+test('the new migration declares the earlier guard superseded', () => {
+  assert.match(guardMigration, /2026-11-24-role-guard-and-services-scope\.sql/);
+  assert.match(guardMigration, /2026-11-23-phase0-admin-security\.sql/);
+});
+
+test('the guard migration revokes provisioner membership from API roles', () => {
+  assert.match(guardMigration, /revoke lsp_role_provisioner from %I/);
+  assert.match(guardMigration, /nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls/);
 });
 
 test('the migration contains no permissive services write policy', () => {
@@ -241,10 +447,10 @@ test('the migration contains no permissive services write policy', () => {
   );
 });
 
-test('the migration fails closed when the helper functions are missing', () => {
-  assert.match(migration, /to_regprocedure\('public\.lsp_is_admin\(\)'\) is null/i);
-  assert.match(migration, /to_regprocedure\('public\.lsp_provider_ids\(\)'\) is null/i);
-  assert.match(migration, /raise exception 'lsp_preflight/i);
+test('the guard migration fails closed when the helper functions are missing', () => {
+  assert.match(guardMigration, /to_regprocedure\('public\.lsp_is_admin\(\)'\) is null/i);
+  assert.match(guardMigration, /to_regprocedure\('public\.lsp_provider_ids\(\)'\) is null/i);
+  assert.match(guardMigration, /raise exception 'lsp_preflight/i);
 });
 
 test('the migration ships rollback instructions', () => {
@@ -256,6 +462,9 @@ test('the migration ships rollback instructions', () => {
 test('schema.sql protects fresh installs with the same guard trigger', () => {
   assert.match(schemaSql, /create or replace function public\.lsp_guard_profile_role\(\)/i);
   assert.match(schemaSql, /create trigger lsp_guard_profile_role before insert or update on public\.profiles/i);
+  // Fresh installs must get the session-identity guard, not the old allowlist.
+  assert.match(schemaSql, /v_session = v_current/);
+  assert.doesNotMatch(schemaSql, /api_role text := current_user/);
 });
 
 test('the permissive services policy is gone from allow-authorized-writes.sql', () => {
