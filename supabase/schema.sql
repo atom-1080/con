@@ -307,29 +307,76 @@ create policy lsp_profiles_update on public.profiles for update to authenticated
 
 -- Role escalation guard. RLS is row-scoped and has no column-level policies, so
 -- lsp_profiles_update alone cannot stop a self-update of {"role":"admin"}. Only
--- a BEFORE trigger sees OLD and NEW. The role is pinned on UPDATE (so
--- api.js ensureProfile(), which echoes `role` on every save, keeps working) and
--- new rows are limited to customer/provider. Privileged role changes happen only
--- through the trusted administrative process (SQL Editor / service_role).
--- Mirrors supabase/migrations/2026-11-24-role-guard-and-services-scope.sql.
+-- a BEFORE trigger sees OLD and NEW.
+--
+-- Trust is decided from the SESSION identity, never from the effective one.
+-- current_user becomes the function owner inside a SECURITY DEFINER function, so
+-- an allowlist on current_user let any definer function owned by postgres change
+-- a role on behalf of an ordinary caller. The guard therefore requires
+-- session_user = current_user (no elevation in effect), no PostgREST request
+-- GUCs, a non-API role, and either rolsuper or membership in the NOLOGIN role
+-- lsp_role_provisioner. Everything else is pinned on UPDATE and limited to
+-- customer/provider on INSERT, which keeps api.js ensureProfile() working.
+-- Mirrors supabase/migrations/2026-11-25-role-guard-trusted-session.sql.
+do $$
+begin
+  if not exists (select 1 from pg_catalog.pg_roles where rolname = 'lsp_role_provisioner') then
+    begin
+      create role lsp_role_provisioner
+        nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+    exception when insufficient_privilege then
+      raise notice 'lsp_role_provisioner not created; superuser sessions can still provision roles';
+    end;
+  end if;
+end $$;
+
 create or replace function public.lsp_guard_profile_role()
 returns trigger language plpgsql security invoker
-set search_path = pg_catalog, public as $$
+set search_path = pg_catalog, public as $guard$
 declare
-  api_role text := current_user;
-  trusted  constant text[] := array['postgres','supabase_admin','supabase_storage_admin','supabase_auth_admin','service_role'];
+  v_session     text := session_user;
+  v_current     text := current_user;
+  v_api_request boolean;
+  v_is_super    boolean := false;
+  v_trusted     boolean := false;
+  v_role        text;
 begin
-  if api_role = any (trusted) then
+  v_api_request :=
+        coalesce(current_setting('request.jwt.claims', true), '') <> ''
+     or coalesce(current_setting('request.method', true), '') <> '';
+
+  if not v_api_request and v_session = v_current then
+    if v_current not in ('anon','authenticated','authenticator','service_role',
+                         'supabase_storage_admin','supabase_auth_admin') then
+      select coalesce(bool_or(r.rolsuper), false)
+        into v_is_super
+        from pg_catalog.pg_roles r
+       where r.rolname = v_current;
+
+      if v_is_super then
+        v_trusted := true;
+      elsif exists (select 1 from pg_catalog.pg_roles r where r.rolname = 'lsp_role_provisioner') then
+        v_trusted := pg_catalog.pg_has_role(v_current, 'lsp_role_provisioner', 'MEMBER');
+      end if;
+    end if;
+  end if;
+
+  if v_trusted then
+    if tg_op = 'INSERT' then
+      v_role := coalesce(new.role, 'customer');
+    else
+      v_role := coalesce(new.role, old.role, 'customer');
+    end if;
+    if v_role not in ('customer','provider','admin') then
+      raise exception 'lsp_role_invalid: % is not a permitted profile role', v_role
+        using errcode = '22023';
+    end if;
+    new.role := v_role;
     return new;
   end if;
 
-  if api_role <> 'authenticated' then
-    raise exception 'lsp_write_denied: role % may not write public.profiles', api_role
-      using errcode = '42501';
-  end if;
-
-  if (select auth.uid()) is null then
-    raise exception 'lsp_write_denied: authenticated session without a subject'
+  if v_current = 'authenticator' then
+    raise exception 'lsp_write_denied: the API login role may not write public.profiles'
       using errcode = '42501';
   end if;
 
@@ -345,10 +392,11 @@ begin
   end if;
 
   if new.role is distinct from old.role then
+    raise log 'lsp_guard_profile_role: blocked role change % -> % for profile %', old.role, new.role, new.id;
     new.role := old.role;
   end if;
   return new;
-end $$;
+end $guard$;
 
 drop trigger if exists lsp_guard_profile_role on public.profiles;
 create trigger lsp_guard_profile_role before insert or update on public.profiles

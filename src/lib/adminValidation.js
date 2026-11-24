@@ -61,6 +61,113 @@ export function resolveProfileRoleChange({
   return { allowed: true, persistedRole: next, reason: '' };
 }
 
+/* ------------------------------------------------- trusted-session model */
+// Mirrors the trigger in
+// supabase/migrations/2026-11-25-role-guard-trusted-session.sql.
+//
+// The database decides authority from the SESSION identity, never from the
+// effective identity: `current_user` becomes the function owner inside a
+// SECURITY DEFINER function, so trusting it let any definer function owned by
+// postgres change a role on behalf of an ordinary caller. `session_user` is the
+// login role and is not changed by SECURITY DEFINER or SET ROLE.
+//
+// Nothing here reads a JWT claim, a header, a custom GUC, localStorage or the
+// frontend role. Those are user-controlled and are never proof of privilege.
+// The API-request flag mirrors PostgREST setting request.jwt.claims /
+// request.method, and it can only ever REMOVE trust.
+
+export const API_ROLES = [
+  'anon',
+  'authenticated',
+  'authenticator',
+  'service_role',
+  'supabase_storage_admin',
+  'supabase_auth_admin',
+];
+
+export function isTrustedAdminSession({
+  sessionUser,
+  currentUser,
+  apiRequest = false,
+  isSuperuser = false,
+  isProvisioner = false,
+} = {}) {
+  const session = String(sessionUser || '').trim();
+  const current = String(currentUser || '').trim();
+
+  // No elevation in effect: this is false inside every SECURITY DEFINER call
+  // made by an application role, which is what closes the ownership bypass.
+  if (session === '' || session !== current) return false;
+  // An API request is never an administration session.
+  if (apiRequest) return false;
+  // An API role is never an administration session, even with membership.
+  if (API_ROLES.includes(current)) return false;
+  return isSuperuser === true || isProvisioner === true;
+}
+
+// The full decision the BEFORE trigger makes, as a pure function.
+//   action 'allow' -> the write proceeds with persistedRole
+//   action 'pin'   -> the write proceeds but the role is held at its old value
+//   action 'deny'  -> the statement fails (code 42501, or 22023 for a bad value)
+export function roleWriteDecision({
+  sessionUser,
+  currentUser,
+  apiRequest = false,
+  isSuperuser = false,
+  isProvisioner = false,
+  operation = 'update',
+  oldRole = null,
+  newRole = null,
+} = {}) {
+  const previous = oldRole === null || oldRole === undefined ? null : String(oldRole).trim().toLowerCase();
+  const requested =
+    newRole === null || newRole === undefined || newRole === ''
+      ? previous || 'customer'
+      : String(newRole).trim().toLowerCase();
+
+  const trusted = isTrustedAdminSession({ sessionUser, currentUser, apiRequest, isSuperuser, isProvisioner });
+
+  if (trusted) {
+    if (!PROFILE_ROLES.includes(requested)) {
+      return { action: 'deny', persistedRole: previous, code: '22023', reason: `Unknown role: ${requested}.` };
+    }
+    return { action: 'allow', persistedRole: requested, code: null, reason: '' };
+  }
+
+  // PostgREST's login role never runs DML itself.
+  if (String(currentUser || '').trim() === 'authenticator') {
+    return {
+      action: 'deny',
+      persistedRole: previous,
+      code: '42501',
+      reason: 'The API login role may not write public.profiles.',
+    };
+  }
+
+  if (operation === 'insert') {
+    if (!['customer', 'provider'].includes(requested)) {
+      return {
+        action: 'deny',
+        persistedRole: previous,
+        code: '42501',
+        reason: 'A profile cannot be created with a privileged role.',
+      };
+    }
+    return { action: 'allow', persistedRole: requested, code: null, reason: '' };
+  }
+
+  if (previous !== null && requested !== previous) {
+    return {
+      action: 'pin',
+      persistedRole: previous,
+      code: null,
+      reason: 'Role changes are restricted to database administration sessions.',
+    };
+  }
+
+  return { action: 'allow', persistedRole: previous === null ? requested : previous, code: null, reason: '' };
+}
+
 // Owner-or-admin, matching the lsp_services_write policy. When the catalogue has
 // no owner column the policy is admin-only, so a provider row is refused there
 // and provider catalogue work happens in provider_skills instead.
