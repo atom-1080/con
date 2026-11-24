@@ -38,6 +38,11 @@ const routes = [
   { pattern: /^\/provider\/profile$/, view: providerView.renderProfile, role: 'provider' },
   { pattern: /^\/provider\/availability$/, view: providerView.renderAvailability, role: 'provider' },
   { pattern: /^\/admin\/?$/, view: adminView.render, role: 'admin' },
+  {
+    pattern: /^\/admin\/(users|services|bookings|verification|complaints|payments|settings)$/,
+    view: adminView.render,
+    role: 'admin',
+  },
 ];
 
 function currentRoute() {
@@ -117,7 +122,16 @@ function navFor(role) {
     ];
   }
   if (role === 'admin') {
-    return [['/admin', 'Overview', 'monitoring']];
+    return [
+      ['/admin', 'Overview', 'monitoring'],
+      ['/admin/users', 'Users', 'group'],
+      ['/admin/services', 'Services', 'handyman'],
+      ['/admin/bookings', 'Bookings', 'receipt_long'],
+      ['/admin/verification', 'Verifications', 'verified_user'],
+      ['/admin/complaints', 'Complaints', 'gavel'],
+      ['/admin/payments', 'Payments', 'payments'],
+      ['/admin/settings', 'Settings', 'settings'],
+    ];
   }
   return [
     ['/', 'Home', 'home'],
@@ -207,6 +221,7 @@ async function render() {
   const ctx = {
     params,
     query,
+    path,
     state,
     identity,
     navigate,
